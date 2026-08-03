@@ -46,63 +46,100 @@ export async function geocodeCity(city) {
 // link. If it's dead, we fall back to a Google Maps link instead of showing
 // a broken URL as if it were bookable.
 // ---------------------------------------------------------------------------
-async function isUrlLive(url, timeoutMs = 4000) {
+async function isUrlLive(url, timeoutMs = 5000) {
   if (!url) return false;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const browserHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+  };
 
-  try {
-    let res = await fetch(url, {
-      method: 'HEAD',
-      redirect: 'follow',
-      signal: controller.signal,
-      headers: { 'User-Agent': 'AITravelAgent/1.0' }
-    });
-
-    if (res.status === 405 || res.status === 501) {
-      res = await fetch(url, {
-        method: 'GET',
-        redirect: 'follow',
-        signal: controller.signal,
-        headers: { 'User-Agent': 'AITravelAgent/1.0' }
-      });
+  const attempt = async (method) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { method, redirect: 'follow', signal: controller.signal, headers: browserHeaders });
+      return res.status;
+    } catch (err) {
+      return null; // network failure / timeout / abort
+    } finally {
+      clearTimeout(timeout);
     }
+  };
 
-    return res.ok || (res.status >= 300 && res.status < 400);
-  } catch (err) {
-    return false;
-  } finally {
-    clearTimeout(timeout);
+  let status = await attempt('HEAD');
+
+  // Some servers reject HEAD outright, or block a plain HEAD as bot-like.
+  // Retry with GET before concluding anything.
+  if (status === null || status === 405 || status === 501 || status === 403) {
+    status = await attempt('GET');
   }
+
+  if (status === null) return false; // genuinely unreachable — real dead link
+
+  // 403/406 after a real GET attempt usually means the site is actively
+  // blocking automated requests (bot detection), NOT that it's actually
+  // down for a human visitor. Treat those as live rather than dead, since
+  // marking them dead would be a false negative.
+  if (status === 403 || status === 406) return true;
+
+  return status >= 200 && status < 400;
+}
+
+// Multiple free public Overpass mirrors — if the primary one returns an
+// error page (HTML instead of JSON), rate-limits, or times out, we retry
+// against a different mirror before giving up entirely.
+const OVERPASS_ENDPOINTS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://lz4.overpass-api.de/api/interpreter'
+];
+
+async function queryOverpass(query, timeoutMs = 12000) {
+  for (const endpoint of OVERPASS_ENDPOINTS) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'User-Agent': 'AITravelAgent/1.0',
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: `data=${encodeURIComponent(query)}`
+      });
+
+      const text = await response.text();
+
+      if (!response.ok || text.trim().startsWith('<')) {
+        continue; // silently try the next mirror
+      }
+
+      return JSON.parse(text);
+    } catch (err) {
+      continue; // silently try the next mirror
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  return null; // every mirror failed
 }
 
 export async function fetchAllNearbyFoodSpots(lat, lon) {
   try {
-    const overpassUrl = 'https://overpass-api.de/api/interpreter';
     const query = `
       [out:json][timeout:15];
       node["amenity"~"restaurant|cafe|bakery|bar|pub"](around:1000, ${lat}, ${lon});
       out 40;
     `;
 
-    const response = await fetch(overpassUrl, {
-      method: 'POST',
-      headers: {
-        'User-Agent': 'AITravelAgent/1.0',
-        'Content-Type': 'application/x-www-form-urlencoded'
-      },
-      body: `data=${encodeURIComponent(query)}`
-    });
+    const data = await queryOverpass(query);
 
-    const text = await response.text();
-
-    if (!response.ok || text.startsWith('<')) {
-      console.warn('Overpass API returned non-JSON response:', text.substring(0, 100));
+    if (!data) {
       return { restaurants: [], cafes: [] };
     }
 
-    const data = JSON.parse(text);
 
     if (!data.elements || data.elements.length === 0) {
       return {

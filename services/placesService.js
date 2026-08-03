@@ -1,5 +1,3 @@
-// services/placesService.js
-
 export async function geocodePlace(placeName, city) {
   try {
     const query = `${placeName}, ${city}`;
@@ -25,10 +23,11 @@ export async function geocodePlace(placeName, city) {
 export async function fetchAllNearbyFoodSpots(lat, lon) {
   try {
     const overpassUrl = 'https://overpass-api.de/api/interpreter';
+    // Reduced radius to 1000m to prevent overlapping identical restaurants for different meals
     const query = `
       [out:json][timeout:15];
-      node["amenity"~"restaurant|cafe|bakery"](around:2000, ${lat}, ${lon});
-      out 15;
+      node["amenity"~"restaurant|cafe|bakery"](around:1000, ${lat}, ${lon});
+      out 40;
     `;
 
     const response = await fetch(overpassUrl, {
@@ -48,19 +47,19 @@ export async function fetchAllNearbyFoodSpots(lat, lon) {
     }
 
     const data = JSON.parse(text);
-    if (!data.elements) return { restaurants: [], cafes: [] };
+    
+    if (!data.elements || data.elements.length === 0) {
+      // Return empty restaurants so the AI doesn't hallucinate links if data is entirely missing
+      return { 
+        restaurants: [], 
+        cafes: [
+          { name: "Nearby Cafe", cuisine: "Cafe", googleMapsUrl: `https://www.google.com/maps/search/?api=1&query=${lat},${lon}+cafes` }
+        ] 
+      };
+    }
 
     const restaurants = [];
     const cafes = [];
-
-    // Helper map for known local spots to guarantee direct actual website links
-    const knownWebsites = {
-      "Bon Gusto": "https://www.bongusto.co.uk",
-      "Goya": "https://www.goyarestaurant.co.uk",
-      "PizzaExpress": "https://www.pizzaexpress.com",
-      "Las Iguanas": "https://www.iguanas.co.uk",
-      "Aubaine": "https://www.aubaine.co.uk"
-    };
 
     data.elements.forEach((place) => {
       const name = place.tags?.name || 'Local Spot';
@@ -68,28 +67,28 @@ export async function fetchAllNearbyFoodSpots(lat, lon) {
       const address = place.tags?.['addr:street'] || '';
       const amenity = place.tags?.amenity;
 
-      // Smart fallback: Check OSM tags first, then known dictionary, otherwise use a direct Google Maps booking/place card link instead of a text search
-      let bookingUrl = place.tags?.website || place.tags?.['contact:website'] || null;
+      // Extract the exact official website if it exists in the database
+      const website = place.tags?.website || place.tags?.['contact:website'];
       
-      if (!bookingUrl) {
-        // Find matching known restaurant or fallback cleanly to a direct Google Maps place interaction link
-        const matchedKey = Object.keys(knownWebsites).find(k => name.toLowerCase().includes(k.toLowerCase()));
-        bookingUrl = matchedKey ? knownWebsites[matchedKey] : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${name} ${address}`)}`;
-      }
-
+      // Always generate the Google Maps URL
       const googleMapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${name} ${address}`)}`;
 
-      const spotInfo = { 
-        name, 
-        cuisine, 
-        bookingUrl,
-        googleMapsUrl
-      };
-
       if (amenity === 'cafe' || amenity === 'bakery') {
-        cafes.push(spotInfo);
+        // Snacks only need Google Maps
+        cafes.push({ 
+          name, 
+          cuisine, 
+          googleMapsUrl 
+        });
       } else {
-        restaurants.push(spotInfo);
+        // LUNCH & DINNER: ONLY push to array if a real website exists!
+        if (website) {
+          restaurants.push({ 
+            name, 
+            cuisine, 
+            bookingUrl: website 
+          });
+        }
       }
     });
 

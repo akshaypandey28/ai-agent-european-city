@@ -53,17 +53,38 @@ export async function fetchAllNearbyFoodSpots(lat, lon) {
     const restaurants = [];
     const cafes = [];
 
+    // Helper map for known local spots to guarantee direct actual website links
+    const knownWebsites = {
+      "Bon Gusto": "https://www.bongusto.co.uk",
+      "Goya": "https://www.goyarestaurant.co.uk",
+      "PizzaExpress": "https://www.pizzaexpress.com",
+      "Las Iguanas": "https://www.iguanas.co.uk",
+      "Aubaine": "https://www.aubaine.co.uk"
+    };
+
     data.elements.forEach((place) => {
       const name = place.tags?.name || 'Local Spot';
-      const website = place.tags?.website || place.tags?.['reservation:website'] || null;
       const cuisine = place.tags?.cuisine || 'General';
       const address = place.tags?.['addr:street'] || '';
       const amenity = place.tags?.amenity;
 
-      const googleMapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${name} ${address}`)}`;
-      const bookingUrl = website || `https://www.google.com/search?q=${encodeURIComponent(`${name} reservation`)}`;
+      // Smart fallback: Check OSM tags first, then known dictionary, otherwise use a direct Google Maps booking/place card link instead of a text search
+      let bookingUrl = place.tags?.website || place.tags?.['contact:website'] || null;
+      
+      if (!bookingUrl) {
+        // Find matching known restaurant or fallback cleanly to a direct Google Maps place interaction link
+        const matchedKey = Object.keys(knownWebsites).find(k => name.toLowerCase().includes(k.toLowerCase()));
+        bookingUrl = matchedKey ? knownWebsites[matchedKey] : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${name} ${address}`)}`;
+      }
 
-      const spotInfo = { name, cuisine, googleMapsUrl, bookingUrl };
+      const googleMapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${name} ${address}`)}`;
+
+      const spotInfo = { 
+        name, 
+        cuisine, 
+        bookingUrl,
+        googleMapsUrl
+      };
 
       if (amenity === 'cafe' || amenity === 'bakery') {
         cafes.push(spotInfo);

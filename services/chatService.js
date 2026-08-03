@@ -6,7 +6,7 @@ const sessions = {};
 
 const INTAKE_SYSTEM_PROMPT = `
 You are a European Travel & Dining AI Agent.
-Your job is to conduct a polite conversational interview with the user to collect ALL 4 required parameters:
+Your job is to conduct a polite conversational interview with the user to collect ALL required parameters in this exact sequence:
 1. city (European city)
 2. itinerary (Free-form text with stops e.g. "Sagrada Familia in morning, Park Güell at 1pm")
 3. meal_preference (Dietary preferences, allergies, halal/kosher, vegan, compound constraints)
@@ -14,7 +14,7 @@ Your job is to conduct a polite conversational interview with the user to collec
 
 INSTRUCTIONS:
 - Review the conversation history.
-- Ask friendly follow-up questions for any missing details.
+- Ask friendly questions guiding the user through the intake in this order: First City, then Itinerary, then Meal Preferences, and finally Number of People.
 - Ask only 1 or 2 clear questions at a time.
 - WHEN ALL 4 PARAMETERS ARE COLLECTED, respond ONLY with a JSON block in this exact format:
 {
@@ -93,32 +93,34 @@ async function generateMealPlan(data) {
     const snacks = cafes;
 
     const synthesisPrompt = `
-    Create a highly concise meal plan for ${data.city}.
+    Create a highly concise meal plan based on the itinerary for ${data.city}.
     
     Trip Details:
     - Itinerary: ${data.itinerary}
     - Meal Preferences: ${data.meal_preference}
+    - Group Size: ${data.group_size}
 
-    Available Places:
+    Available Places with Verified Data:
     Lunches: ${JSON.stringify(lunches)}
     Dinners: ${JSON.stringify(dinners)}
     Snacks: ${JSON.stringify(snacks)}
 
     STRICT FORMATTING RULES:
-    - Output ALWAYS line-by-line. Absolutely NO paragraph explanations.
-    - DO NOT include conversational filler, introductions, or conclusions (e.g., skip "So you're headed to...", "I hope this helps").
-    - Provide exactly 3 Lunch places, 3 DIFFERENT Dinner places, and 2 Snack places.
+    - Output ALWAYS line-by-line. Absolutely NO paragraph explanations or conversational text.
+    - Provide exactly 3 to 4 Lunch options, 3 to 4 Dinner options, and 2 to 3 Pit stops snacking options.
+    - For Lunch and Dinner options, use the restaurant's official website or booking URL ('bookingUrl') as the clickable link. DO NOT use map links for lunch or dinner.
+    - For Pit Stops Snacking options, use the Google Maps link ('googleMapsUrl') as the clickable link.
     - Keep descriptions to a single short sentence.
     - Format exactly like this:
 
-    ### Lunch
-    * **[Restaurant Name](Booking Link)** - Short 1-sentence description.
+    ### Lunch Options
+    * **[Restaurant Name](bookingUrl)** - Short 1-sentence description.
     
-    ### Dinner
-    * **[Restaurant Name](Booking Link)** - Short 1-sentence description.
+    ### Dinner Options
+    * **[Restaurant Name](bookingUrl)** - Short 1-sentence description.
     
-    ### Snacks
-    * **[Place Name](Google Maps Link)** - Short 1-sentence description.
+    ### Pit Stops Snacking
+    * **[Place Name](googleMapsUrl)** - Short 1-sentence description.
     `;
 
     const finalRes = await groq.chat.completions.create({

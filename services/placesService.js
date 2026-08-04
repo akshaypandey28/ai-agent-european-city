@@ -188,7 +188,12 @@ export async function fetchAllNearbyFoodSpots(lat, lon) {
           cuisine: r.cuisine,
           amenity: r.amenity,
           tags: r.tags,
+          website: r.candidateWebsite, // raw OSM website — kept separately so scraping
+                                        // (which goes through a remote proxy, not your
+                                        // local network) isn't blocked by a local
+                                        // liveness-check false negative
           bookingUrl: live ? r.candidateWebsite : r.googleMapsUrl,
+          googleMapsUrl: r.googleMapsUrl,
           linkVerified: live
         };
       })

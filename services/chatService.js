@@ -1,5 +1,6 @@
 import groq from '../config/groq.js';
 import { geocodePlace, geocodeCity, fetchAllNearbyFoodSpots } from './placesService.js';
+import { enrichWithMenus } from './menuService.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -15,7 +16,6 @@ async function resolveCoords(stopName, city, cache) {
 
     let coords = await geocodePlace(stopName, city);
     if (!coords) {
-        // Respect Nominatim's rate limits before a second outbound call
         await sleep(1100);
         coords = await geocodeCity(city);
     }
@@ -111,19 +111,17 @@ export const processChatMessage = async (sessionId, message) => {
         session.history.push({ role: 'assistant', content: aiText });
         return { reply: aiText, completed: false };
     } catch (err) {
-        
         if (isGroqRateLimit(err)) {
             console.error('\n======================================================');
-            console.error('🚨 GROQ API RATE LIMIT REACHED 🚨');
+            console.error('GROQ API RATE LIMIT REACHED');
             console.error(rateLimitMessage(err));
             console.error('======================================================\n');
-            
-            throw new Error("Service temporarily unavailable due to backend rate limits. Check CMD for details.");
+
+            throw new Error("Service temporarily unavailable due to backend rate limits. Check terminal for details.");
         }
-        throw err; // unexpected errors still bubble up to the controller's 500 handler
+        throw err;
     }
 };
-
 
 const MEAL_TARGET_HOURS = {
     lunch: 13.0,
@@ -165,14 +163,9 @@ async function parseItineraryStops(itinerary, city) {
         console.error("Failed to parse itinerary stops:", e);
     }
 
-    // Deterministic fallback if the model call/parse fails entirely
     return [{ name: itinerary, approx_time_24h: 13.0 }];
 }
 
-// Pick the stop whose approx_time_24h is closest to the target meal hour.
-// This is fully deterministic — no LLM guessing about which stop "counts"
-// as lunch vs dinner, and it degrades gracefully to the single stop
-// available when the itinerary only mentions one place.
 function pickStopForMeal(stops, targetHour) {
     let best = stops[0];
     let bestDiff = Math.abs(stops[0].approx_time_24h - targetHour);
@@ -186,11 +179,9 @@ function pickStopForMeal(stops, targetHour) {
     return best;
 }
 
-
 function parseGroupSize(groupSizeText) {
     const text = (groupSizeText || "").toLowerCase();
 
-    // Sum up any explicit numbers mentioned (e.g. "2 adults + 1 toddler" -> 3)
     const numbers = text.match(/\d+/g)?.map(Number) || [];
     const totalCount = numbers.length > 0 ? numbers.reduce((a, b) => a + b, 0) : 1;
 
@@ -200,9 +191,6 @@ function parseGroupSize(groupSizeText) {
     return { totalCount, hasChild, isLargeGroup };
 }
 
-// Score + filter a list of raw OSM restaurant candidates against the
-// group's real constraints. This is the part that actually changes the
-// output, not just the description text.
 function applyGroupSizeFilter(spots, groupInfo) {
     return spots
         .map((spot) => {
@@ -212,23 +200,19 @@ function applyGroupSizeFilter(spots, groupInfo) {
             if (groupInfo.hasChild) {
                 if (tags.highchair === 'yes') score += 2;
                 if (tags.outdoor_seating === 'yes') score += 1;
-                // Bars/pubs without food focus are a poor fit with a toddler
                 if (spot.amenity === 'bar' || spot.amenity === 'pub') score -= 2;
             }
 
             if (groupInfo.isLargeGroup) {
-                // Fast food / takeaway-oriented spots rarely seat 6+ comfortably
                 if (tags.takeaway === 'only') score -= 3;
-                if (tags.outdoor_seating === 'yes') score += 1; // more likely to flex seating
+                if (tags.outdoor_seating === 'yes') score += 1;
             }
 
             return { ...spot, _groupScore: score };
         })
-        // Hard-exclude the worst mismatches rather than just down-ranking them
         .filter((spot) => spot._groupScore > -3)
         .sort((a, b) => b._groupScore - a._groupScore);
 }
-
 
 async function parseItineraryDays(itinerary) {
     const dayPrompt = `
@@ -263,15 +247,12 @@ async function parseItineraryDays(itinerary) {
         console.error("Failed to split itinerary into days:", e);
     }
 
-    // Deterministic fallback: treat the whole thing as a single day
     return [{ label: "Day 1", itinerary_text: itinerary }];
 }
 
 async function generateFullTripPlan(data) {
     const days = await parseItineraryDays(data.itinerary);
 
-    // Single-day itinerary: keep output exactly as before, no extra heading
-    // noise for the common case.
     if (days.length === 1) {
         return generateMealPlan({ ...data, itinerary: days[0].itinerary_text });
     }
@@ -283,7 +264,6 @@ async function generateFullTripPlan(data) {
 
     return dayPlans.join('\n\n---\n\n');
 }
-
 
 function parseMealPreference(text) {
     const t = (text || '').toLowerCase();
@@ -321,11 +301,10 @@ function applyDietFilter(spots, dietInfo) {
             for (const check of checks) {
                 if (!check.required) continue;
                 if (check.tagVal === 'no') {
-                    hardExcluded = true; // OSM explicitly says this spot can't meet the requirement
+                    hardExcluded = true;
                 } else if (check.tagVal === 'yes' || check.tagVal === 'only') {
-                    score += 3; // verified match, prioritize strongly
+                    score += 3;
                 }
-                // tag absent entirely: no score change — unverifiable, not excluded
             }
 
             if (dietInfo.cuisineKeywords.length > 0) {
@@ -341,6 +320,15 @@ function applyDietFilter(spots, dietInfo) {
         .sort((a, b) => b._dietScore - a._dietScore);
 }
 
+// ---------------------------------------------------------------------------
+// MENU ENRICHMENT (batched, preference-aware):
+//  1. Scrape raw page text for each candidate restaurant concurrently — pure
+//     network work, zero Groq tokens.
+//  2. ONE Groq call per meal slot (not per restaurant) extracts dish matches
+//     for every scraped restaurant at once, grounded in the actual scraped
+//     text, and tailored to whatever the user actually said (vegetarian,
+//     vegan, halal, non-veg, etc.) instead of being hardcoded to vegetarian.
+// ---------------------------------------------------------------------------
 async function generateMealPlan(data) {
     const stops = await parseItineraryStops(data.itinerary, data.city);
     const groupInfo = parseGroupSize(data.group_size);
@@ -350,10 +338,6 @@ async function generateMealPlan(data) {
     const dinnerStop = pickStopForMeal(stops, MEAL_TARGET_HOURS.dinner);
     const snackStop = pickStopForMeal(stops, MEAL_TARGET_HOURS.snack);
 
-    // Shared cache means an itinerary with one stop (all three meals
-    // anchoring to the same landmark) geocodes it exactly once, instead
-    // of hitting Nominatim three times back-to-back and risking a
-    // rate-limit failure on one of the calls.
     const geocodeCache = new Map();
     const lunchCoords = await resolveCoords(lunchStop.name, data.city, geocodeCache);
     const dinnerCoords = await resolveCoords(dinnerStop.name, data.city, geocodeCache);
@@ -364,13 +348,31 @@ async function generateMealPlan(data) {
     }
 
     const emptySpots = { restaurants: [], cafes: [] };
-    const lunchData = lunchCoords ? await fetchAllNearbyFoodSpots(lunchCoords.lat, lunchCoords.lon) : emptySpots;
-    const dinnerData = dinnerCoords ? await fetchAllNearbyFoodSpots(dinnerCoords.lat, dinnerCoords.lon) : emptySpots;
-    const snackData = snackCoords ? await fetchAllNearbyFoodSpots(snackCoords.lat, snackCoords.lon) : emptySpots;
+    const foodSpotCache = new Map();
+    let overpassCallCount = 0;
+    const resolveFoodSpots = async (coords) => {
+        if (!coords) return emptySpots;
+        const key = `${coords.lat},${coords.lon}`;
+        if (foodSpotCache.has(key)) return foodSpotCache.get(key);
+        if (overpassCallCount > 0) await sleep(800);
+        overpassCallCount += 1;
+        const result = await fetchAllNearbyFoodSpots(coords.lat, coords.lon);
+        foodSpotCache.set(key, result);
+        return result;
+    };
 
-    const lunches = applyGroupSizeFilter(applyDietFilter(lunchData.restaurants, dietInfo), groupInfo).slice(0, 5);
-    const dinners = applyGroupSizeFilter(applyDietFilter(dinnerData.restaurants, dietInfo), groupInfo).slice(0, 5);
-    const snacks = applyGroupSizeFilter(applyDietFilter(snackData.cafes, dietInfo), groupInfo).slice(0, 4);
+    const lunchData = await resolveFoodSpots(lunchCoords);
+    const dinnerData = await resolveFoodSpots(dinnerCoords);
+    const snackData = await resolveFoodSpots(snackCoords);
+
+    const rawLunches = applyGroupSizeFilter(applyDietFilter(lunchData.restaurants, dietInfo), groupInfo).slice(0, 4);
+    const rawDinners = applyGroupSizeFilter(applyDietFilter(dinnerData.restaurants, dietInfo), groupInfo).slice(0, 4);
+    const snacks = applyGroupSizeFilter(applyDietFilter(snackData.cafes, dietInfo), groupInfo).slice(0, 3);
+
+    const [lunches, dinners] = await Promise.all([
+        enrichWithMenus(rawLunches, dietInfo, data.meal_preference),
+        enrichWithMenus(rawDinners, dietInfo, data.meal_preference)
+    ]);
 
     const synthesisPrompt = `
     Create a highly concise meal plan based on the itinerary for ${data.city}.
@@ -378,34 +380,29 @@ async function generateMealPlan(data) {
     Trip Details:
     - Itinerary: ${data.itinerary}
     - Meal Preferences: ${data.meal_preference}
-    NOTE: Restaurants below have already been filtered/prioritized against any vegetarian/vegan/halal/kosher
-    requirement using verified restaurant data where it exists. If the preference mentions a specific allergy
-    (e.g. "no eggs"), that could NOT be verified against real data — phrase any such mention as something the
-    traveller should confirm with the restaurant directly, never as a guarantee.
     - Group Size: ${data.group_size} (headcount: ${groupInfo.totalCount}, young children present: ${groupInfo.hasChild})
 
-    These places have ALREADY been filtered and ranked for this group's size and composition.
-    Available Places with Verified Data:
+    Available Places with Real Scraped Menu Data:
     Lunch near ${lunchStop.name} (approx ${lunchStop.approx_time_24h}h): ${JSON.stringify(lunches)}
     Dinner near ${dinnerStop.name} (approx ${dinnerStop.approx_time_24h}h): ${JSON.stringify(dinners)}
     Snacks near ${snackStop.name} (approx ${snackStop.approx_time_24h}h): ${JSON.stringify(snacks)}
 
     STRICT FORMATTING RULES:
     - Output ALWAYS line-by-line. Absolutely NO paragraph explanations or conversational text.
-    - ONLY use the places provided above. DO NOT invent restaurants.
+    - ONLY use the places provided above. DO NOT invent restaurants or prices.
     - NEVER alter, guess, or add to the URLs. Copy the EXACT URL string provided.
+    - For Lunch and Dinner, list dishes from the 'matching_dishes' field, matched to the stated Meal Preferences above.
+    - If 'matching_dishes' is empty for a restaurant, write: "Specific dish details unavailable — confirm dietary-matching options on-site."
     - Provide up to 4 Lunch options, up to 4 Dinner options, and up to 3 Snacking options.
     - NEVER REPEAT A RESTAURANT. Ensure options are completely unique.
-    - Mention dietary match in every description. Only mention group-size/child-friendliness
-      if it was actually a deciding factor in that spot being pre-filtered in.
     - MANDATORY LINK FORMATTING: [**Place Name**](URL)
     - Format exactly like this template:
 
     ### Lunch Options near ${lunchStop.name}
-    * [**Restaurant Name**](exact_url_from_json) - Short 1-sentence description.
+    * [**Restaurant Name**](exact_url_from_json) - [Dish Name] ([Exact Price]), or the unavailable-fallback text. Short 1-sentence fit description.
 
     ### Dinner Options near ${dinnerStop.name}
-    * [**Restaurant Name**](exact_url_from_json) - Short 1-sentence description.
+    * [**Restaurant Name**](exact_url_from_json) - [Dish Name] ([Exact Price]), or the unavailable-fallback text. Short 1-sentence fit description.
 
     ### Pit Stops Snacking near ${snackStop.name}
     * [**Place Name**](exact_url_from_json) - Short 1-sentence description.

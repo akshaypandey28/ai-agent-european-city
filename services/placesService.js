@@ -44,7 +44,7 @@ export async function geocodeCity(city) {
 // LINK LIVENESS CHECK: OSM's `website` tag is community-edited and frequently
 // stale. We verify it actually resolves before treating it as a bookable
 // link. If it's dead, we fall back to a Google Maps link instead of showing
-// a broken URL as if it were bookable.
+// a broken URL.
 // ---------------------------------------------------------------------------
 async function isUrlLive(url, timeoutMs = 5000) {
   if (!url) return false;
@@ -68,18 +68,14 @@ async function isUrlLive(url, timeoutMs = 5000) {
 
   let status = await attempt('HEAD');
 
-  // Some servers reject HEAD outright, or block a plain HEAD as bot-like.
-  // Retry with GET before concluding anything.
+  
   if (status === null || status === 405 || status === 501 || status === 403) {
     status = await attempt('GET');
   }
 
   if (status === null) return false; // genuinely unreachable — real dead link
 
-  // 403/406 after a real GET attempt usually means the site is actively
-  // blocking automated requests (bot detection), NOT that it's actually
-  // down for a human visitor. Treat those as live rather than dead, since
-  // marking them dead would be a false negative.
+  
   if (status === 403 || status === 406) return true;
 
   return status >= 200 && status < 400;
